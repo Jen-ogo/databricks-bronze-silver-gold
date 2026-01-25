@@ -42,19 +42,17 @@ Then we ingest into **Snowflake BRONZE** (WKT kept for debug), and transform int
 
 ## Repo layout
 
-.
-├─ databricks_bronze_silver_gold/
-│  ├─ bronze_ingest.py              # Databricks ingest / ETL helpers (batch prototype)
-│  ├─ SILVER_databricks.sql         # Silver layer transforms (Databricks SQL prototype)
-│  └─ GOLD_databricks.sql           # Gold layer features (Databricks SQL prototype)
-│
-├─ snowflake_bronze_silver_gold/
-│  ├─ bronze_stage_ingest_ddl.sql    # Snowflake bootstrap + BRONZE ingest from ADLS (stages/streams/tasks)
-│  ├─ SILVER_snowflake.sql           # Silver transforms (Snowflake SQL prototype)
-│  └─ GOLD_snowflake.sql             # Gold transforms / features (Snowflake SQL prototype)
-│
-├─ .gitignore
-└─ README.md
+### Databricks
+
+databricks_bronze_silver_gold/
+  bronze_ingest.py            # batch ingest prototype / helpers
+  SILVER_databricks.sql       # silver transforms (prototype)
+  GOLD_databricks.sql         # gold features (prototype)
+  
+snowflake_bronze_silver_gold/
+  bronze_stage_ingest_ddl.sql # ADLS Parquet -> BRONZE ingest infra (stages/streams/tasks/procs)
+  SILVER_snowflake.sql        # silver transforms (prototype)
+  GOLD_snowflake.sql          # gold transforms/features (prototype)
 
 ## Snowflake: what’s inside (DEV scaffolding)
 
