@@ -40,9 +40,11 @@ Then we ingest into **Snowflake BRONZE** (WKT kept for debug), and transform int
 **Gold**
 - analytical / ML-ready feature tables (e.g., H3 features, regional aggregates)
 
+```md
 ## Repo layout
 
 ### Databricks
+```text
 
 databricks_bronze_silver_gold/
   bronze_ingest.py            # batch ingest prototype / helpers
