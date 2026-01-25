@@ -59,10 +59,8 @@ Then we ingest into **Snowflake BRONZE** (WKT kept for debug), and transform int
 │
 ├─ .gitignore
 └─ README.md
----
 
-## Repo layout
-
+```
 ## Snowflake: what’s inside (DEV scaffolding)
 
 The Snowflake folder provides a canonical bootstrap for ingesting Parquet from ADLS Gen2 into BRONZE using:
