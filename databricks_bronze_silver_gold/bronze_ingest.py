@@ -20,6 +20,7 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType
 from delta.tables import DeltaTable
 
 
@@ -630,7 +631,7 @@ run_stream_available_now(
 )
 
 
-# 3.4 EUROSTAT tran_r_elvehst (tidy snapshot)
+## 3.4 EUROSTAT tran_r_elvehst (tidy snapshot)
 T_EV = f"{CATALOG}.{SCHEMA}.eurostat_tran_r_elvehst"
 
 create_delta_table_if_missing(
@@ -653,42 +654,66 @@ create_delta_table_if_missing(
 )
 
 pattern_ev = f"{ROOT_EURO}/tran_r_elvehst/snapshot=*/tran_r_elvehst_tidy.parquet"
-raw_ev = read_autoloader_parquet(pattern=pattern_ev, schema_location=f"{SCHEMA_BASE}/eurostat_tran_r_elvehst")
+schema_loc_ev = f"{SCHEMA_BASE}/eurostat_tran_r_elvehst"
+
+# --- harden Auto Loader: explicit schema (safe types) ---
+ev_schema = StructType([
+    StructField("dataset", StringType(), True),
+    StructField("freq", StringType(), True),
+    StructField("vehicle", StringType(), True),
+    StructField("unit", StringType(), True),
+    StructField("geo", StringType(), True),
+
+    # IMPORTANT: parquet has time as BINARY -> read as STRING
+    StructField("time", StringType(), True),
+
+    StructField("value", DoubleType(), True),
+
+    # ingest_ts remains nanos (often LONG)
+    StructField("ingest_ts", LongType(), True),
+])
+
+raw_ev = (
+    spark.readStream.format("cloudFiles")
+      .option("cloudFiles.format", "parquet")
+      .schema(ev_schema)
+      .option("cloudFiles.schemaLocation", f"{SCHEMA_BASE}/eurostat_tran_r_elvehst")
+      .option("cloudFiles.schemaEvolutionMode", "none")
+      .load(pattern_ev)
+      .withColumn("_source_file", F.input_file_name())
+)
 
 sf = F.col("_source_file")
 snapshot = F.regexp_extract(sf, r"/snapshot=([^/]+)/", 1)
 
-# ingest_ts is stored as epoch nanoseconds in parquet
-# Convert to TIMESTAMP (seconds = nanos / 1e9)
+# parse year robustly from time string (supports '2023', '2023-01', etc.)
+year_str = F.regexp_extract(F.col("time"), r"([0-9]{4})", 1)
+year = F.when(F.length(year_str) == 4, year_str.cast("long")).otherwise(F.lit(None).cast("long"))
+
 ev_df = (
     raw_ev.select(
         F.col("_source_file").alias("source_file"),
         snapshot.alias("snapshot"),
+
         F.col("dataset").cast("string").alias("dataset"),
         F.col("freq").cast("string").alias("freq"),
         F.col("vehicle").cast("string").alias("vehicle"),
         F.col("unit").cast("string").alias("unit"),
         F.col("geo").cast("string").alias("geo"),
-        F.col("time").cast("long").alias("year"),
+
+        year.alias("year"),
+
         F.when(F.col("value").cast("double") == F.lit(0.0), F.lit(None))
-        .otherwise(F.col("value").cast("double"))
-        .alias("value"),
+         .otherwise(F.col("value").cast("double"))
+         .alias("value"),
+
         F.col("ingest_ts").cast("long").alias("ingest_ts_raw"),
         F.to_timestamp(F.from_unixtime((F.col("ingest_ts").cast("double") / F.lit(1e9)))).alias("ingest_ts"),
+
         F.current_timestamp().alias("load_ts"),
     )
     .where(F.col("year").isNotNull())
     .where(F.col("value").isNotNull())
-)
-
-run_stream_available_now(
-    df=ev_df,
-    checkpoint_location=f"{CHECKPOINT_BASE}/eurostat_tran_r_elvehst",
-    foreach_batch_fn=lambda mb, bid: foreach_batch_delete_by_source_file_then_append(
-        microbatch_df=mb,
-        batch_id=bid,
-        target_table_fqn=T_EV,
-    ),
 )
 
 
