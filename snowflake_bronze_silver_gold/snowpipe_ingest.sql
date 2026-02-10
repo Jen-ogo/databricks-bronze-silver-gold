@@ -1,0 +1,306 @@
+/* =============================================================================
+   GEO_PROJECT — FULL BOOTSTRAP: Snowpipe landing ingest + Monitoring (idempotent)
+
+   Pattern:
+     ADLS STAGE -> SNOWPIPES (AUTO_INGEST) -> BRONZE.LND_* (append-only VARIANT)
+     MONITORING snapshots:
+       - pipe status
+       - copy history per PIPE (more accurate than by table)
+
+   IMPORTANT:
+   - Snowpipe AUTO_INGEST on Azure requires:
+       1) Azure Storage Queue exists (snowpipe-osm / snowpipe-eurostat / snowpipe-gisco)
+       2) NOTIFICATION INTEGRATION created in Snowflake
+       3) You open AZURE_CONSENT_URL from DESC NOTIFICATION INTEGRATION and grant consent
+       4) Assign RBAC to the Enterprise App on the queue (or storage account):
+          "Storage Queue Data Contributor" (minimum to read messages)
+   - Snowpipe does NOT auto-load old files present before pipe creation.
+     Use: ALTER PIPE <pipe> REFRESH;
+
+   Your current lake root:
+     azure://stgeodbxuc.blob.core.windows.net/uc-root
+   Raw folders:
+     .../raw/osm/
+     .../raw/eurostat/
+     .../raw/gisco/
+   ============================================================================= */
+
+-- =============================================================================
+-- 0) CONTEXT + SCHEMAS (idempotent)
+-- =============================================================================
+USE ROLE ACCOUNTADMIN;
+USE WAREHOUSE COMPUTE_WH;
+
+CREATE DATABASE IF NOT EXISTS GEO_PROJECT;
+USE DATABASE GEO_PROJECT;
+
+CREATE SCHEMA IF NOT EXISTS TASKS;
+CREATE SCHEMA IF NOT EXISTS BRONZE;
+CREATE SCHEMA IF NOT EXISTS SILVER;
+CREATE SCHEMA IF NOT EXISTS GOLD;
+CREATE SCHEMA IF NOT EXISTS MONITORING;
+
+-- =============================================================================
+-- 1) STORAGE INTEGRATION + FILE FORMAT + STAGES (idempotent)
+-- =============================================================================
+USE SCHEMA TASKS;
+
+CREATE OR REPLACE STORAGE INTEGRATION ADLS_GEO_INT
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = AZURE
+  ENABLED = TRUE
+  AZURE_TENANT_ID = '3600a0f2-48df-4c6f-9503-7eded884a513'
+  STORAGE_ALLOWED_LOCATIONS = ('azure://stgeodbxuc.blob.core.windows.net/uc-root');
+
+CREATE OR REPLACE FILE FORMAT TASKS.FF_PARQUET
+  TYPE = PARQUET
+  COMPRESSION = AUTO;
+
+-- Optional root stage
+CREATE OR REPLACE STAGE TASKS.GEO_ADLS_STAGE
+  URL = 'azure://stgeodbxuc.blob.core.windows.net/uc-root'
+  STORAGE_INTEGRATION = ADLS_GEO_INT
+  FILE_FORMAT = TASKS.FF_PARQUET;
+
+-- Dataset stages
+CREATE OR REPLACE STAGE TASKS.OSM_RAW_STAGE
+  URL = 'azure://stgeodbxuc.blob.core.windows.net/uc-root/raw/osm/'
+  STORAGE_INTEGRATION = ADLS_GEO_INT
+  FILE_FORMAT = TASKS.FF_PARQUET;
+
+CREATE OR REPLACE STAGE TASKS.EUROSTAT_RAW_STAGE
+  URL = 'azure://stgeodbxuc.blob.core.windows.net/uc-root/raw/eurostat/'
+  STORAGE_INTEGRATION = ADLS_GEO_INT
+  FILE_FORMAT = TASKS.FF_PARQUET;
+
+CREATE OR REPLACE STAGE TASKS.GISCO_RAW_STAGE
+  URL = 'azure://stgeodbxuc.blob.core.windows.net/uc-root/raw/gisco/'
+  STORAGE_INTEGRATION = ADLS_GEO_INT
+  FILE_FORMAT = TASKS.FF_PARQUET;
+
+-- Enable DIRECTORY (for DIRECTORY(@stage) debug and sanity checks)
+ALTER STAGE TASKS.OSM_RAW_STAGE
+  SET DIRECTORY = ( ENABLE = TRUE AUTO_REFRESH = FALSE );
+
+ALTER STAGE TASKS.EUROSTAT_RAW_STAGE
+  SET DIRECTORY = ( ENABLE = TRUE AUTO_REFRESH = FALSE );
+
+ALTER STAGE TASKS.GISCO_RAW_STAGE
+  SET DIRECTORY = ( ENABLE = TRUE AUTO_REFRESH = FALSE );
+
+-- =============================================================================
+-- 2) NOTIFICATION INTEGRATIONS (idempotent)
+-- =============================================================================
+-- Queues must exist in Azure:
+--   https://stgeodbxuc.queue.core.windows.net/snowpipe-osm
+--   https://stgeodbxuc.queue.core.windows.net/snowpipe-eurostat
+--   https://stgeodbxuc.queue.core.windows.net/snowpipe-gisco
+--
+-- After create:
+--   DESC NOTIFICATION INTEGRATION <...>;
+-- Open AZURE_CONSENT_URL once and grant consent.
+-- Then give RBAC to the Enterprise App on the Queue/Storage Account:
+--   Storage Queue Data Contributor
+USE SCHEMA TASKS;
+
+CREATE OR REPLACE NOTIFICATION INTEGRATION GEO_AZ_NOTIF_OSM
+  TYPE = QUEUE
+  NOTIFICATION_PROVIDER = AZURE_STORAGE_QUEUE
+  ENABLED = TRUE
+  AZURE_TENANT_ID = '3600a0f2-48df-4c6f-9503-7eded884a513'
+  AZURE_STORAGE_QUEUE_PRIMARY_URI = 'https://stgeodbxuc.queue.core.windows.net/snowpipe-osm';
+
+CREATE OR REPLACE NOTIFICATION INTEGRATION GEO_AZ_NOTIF_EUROSTAT
+  TYPE = QUEUE
+  NOTIFICATION_PROVIDER = AZURE_STORAGE_QUEUE
+  ENABLED = TRUE
+  AZURE_TENANT_ID = '3600a0f2-48df-4c6f-9503-7eded884a513'
+  AZURE_STORAGE_QUEUE_PRIMARY_URI = 'https://stgeodbxuc.queue.core.windows.net/snowpipe-eurostat';
+
+CREATE OR REPLACE NOTIFICATION INTEGRATION GEO_AZ_NOTIF_GISCO
+  TYPE = QUEUE
+  NOTIFICATION_PROVIDER = AZURE_STORAGE_QUEUE
+  ENABLED = TRUE
+  AZURE_TENANT_ID = '3600a0f2-48df-4c6f-9503-7eded884a513'
+  AZURE_STORAGE_QUEUE_PRIMARY_URI = 'https://stgeodbxuc.queue.core.windows.net/snowpipe-gisco';
+
+-- =============================================================================
+-- 3) LANDING TABLES (append-only VARIANT)
+-- =============================================================================
+USE SCHEMA BRONZE;
+
+-- OSM (8)
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_ADMIN               (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_ROADS               (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_CHARGING            (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_POI_POINTS          (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_POI_POLYGONS        (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_PT_POINTS           (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_PT_LINES            (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_OSM_BUILDINGS_ACTIVITY  (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+
+-- GISCO (1)
+CREATE OR REPLACE TABLE BRONZE.LND_GISCO_NUTS              (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+
+-- EUROSTAT (3)
+CREATE OR REPLACE TABLE BRONZE.LND_EUROSTAT_LAU_DEGURBA               (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_EUROSTAT_CENSUS_GRID_2021_EUROPE   (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+CREATE OR REPLACE TABLE BRONZE.LND_EUROSTAT_TRAN_R_ELVEHST            (RAW VARIANT, SOURCE_FILE STRING, LOAD_TS TIMESTAMP_NTZ);
+
+-- =============================================================================
+-- 4) SNOWPIPES (AUTO_INGEST) — correct regex patterns + correct integrations
+-- =============================================================================
+USE SCHEMA TASKS;
+
+-- OSM stage relative paths start with: poland/... or germany/... (no leading raw/osm/)
+-- Patterns below match: <country>/<region>/<dataset>/dt=YYYY-MM-DD/<file>_sf.parquet
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_ADMIN
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_ADMIN (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/admin\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/admin_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_ROADS
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_ROADS (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/roads\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/roads_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_CHARGING
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_CHARGING (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/charging\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/charging_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_POI_POINTS
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_POI_POINTS (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/poi_points\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/poi_points_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_POI_POLYGONS
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_POI_POLYGONS (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/poi_polygons\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/poi_polygons_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_PT_POINTS
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_PT_POINTS (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/pt_points\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/pt_points_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_PT_LINES
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_PT_LINES (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/pt_lines\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/pt_lines_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_OSM_BUILDINGS_ACTIVITY
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_OSM'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_OSM_BUILDINGS_ACTIVITY (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.OSM_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '.*\/buildings_activity\/dt=[0-9]{4}-[0-9]{2}-[0-9]{2}\/buildings_activity_sf[.]parquet$';
+
+-- ---------- GISCO ----------
+-- Stage URL is .../raw/gisco/
+-- Relative paths start with: nuts/year=YYYY/scale=.../crs=.../level=.../...
+CREATE OR REPLACE PIPE TASKS.P_GISCO_NUTS
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_GISCO'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_GISCO_NUTS (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.GISCO_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '^nuts\/year=[0-9]{4}\/scale=[^\/]+\/crs=[0-9]+\/level=[0-9]+\/.*[.]parquet$';
+
+-- ---------- EUROSTAT ----------
+-- Stage URL is .../raw/eurostat/
+-- Relative paths start with: degurba/... or population_grid/... or tran_r_elvehst/...
+CREATE OR REPLACE PIPE TASKS.P_EUROSTAT_LAU_DEGURBA
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_EUROSTAT'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_EUROSTAT_LAU_DEGURBA (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.EUROSTAT_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '^degurba\/lau\/year=[0-9]{4}\/.*_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_EUROSTAT_CENSUS_GRID_2021_EUROPE
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_EUROSTAT'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_EUROSTAT_CENSUS_GRID_2021_EUROPE (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.EUROSTAT_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '^population_grid\/europe\/census_grid_2021\/.*_sf[.]parquet$';
+
+CREATE OR REPLACE PIPE TASKS.P_EUROSTAT_TRAN_R_ELVEHST
+  AUTO_INGEST = TRUE
+  INTEGRATION = 'GEO_AZ_NOTIF_EUROSTAT'
+AS
+COPY INTO GEO_PROJECT.BRONZE.LND_EUROSTAT_TRAN_R_ELVEHST (RAW, SOURCE_FILE, LOAD_TS)
+FROM (
+  SELECT $1, METADATA$FILENAME::STRING, CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+  FROM @TASKS.EUROSTAT_RAW_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET)
+PATTERN = '^tran_r_elvehst\/snapshot=[^\/]+\/tran_r_elvehst_tidy[.]parquet$';
