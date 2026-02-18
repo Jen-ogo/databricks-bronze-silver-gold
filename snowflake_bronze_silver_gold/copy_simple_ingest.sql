@@ -248,3 +248,70 @@ FILE_FORMAT = (FORMAT_NAME = TASKS.FF_PARQUET);
 --   START_TIME => DATEADD('HOUR', -24, CURRENT_TIMESTAMP())
 -- ))
 -- ORDER BY LAST_LOAD_TIME DESC;
+
+
+
+MERGE INTO SILVER.ORDERS t
+USING (
+  WITH parsed AS (
+    SELECT
+      order_id::STRING                                    AS order_id,
+      payload:customer_id::NUMBER                         AS customer_id,
+      payload:order_cost::NUMBER(10,2)                    AS order_cost,
+      TO_TIMESTAMP_NTZ(payload:order_ts::STRING)          AS order_ts,
+      ingestion_ts::TIMESTAMP_NTZ                         AS ingestion_ts
+    FROM BRONZE.ORDERS_RAW
+  )
+  SELECT
+    order_id, customer_id, order_cost, order_ts, ingestion_ts
+  FROM parsed
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY order_id
+    ORDER BY ingestion_ts DESC
+  ) = 1
+) s
+ON t.order_id = s.order_id
+WHEN MATCHED AND s.ingestion_ts > t.ingestion_ts THEN UPDATE SET
+  t.customer_id  = s.customer_id,
+  t.order_cost   = s.order_cost,
+  t.order_ts     = s.order_ts,
+  t.ingestion_ts = s.ingestion_ts
+WHEN NOT MATCHED THEN INSERT (order_id, customer_id, order_cost, order_ts, ingestion_ts)
+VALUES (s.order_id, s.customer_id, s.order_cost, s.order_ts, s.ingestion_ts);
+
+
+select c.customer_id
+from CUSTOMERS c
+where not exists (
+  select 1
+  from ORDERS_2026 o
+  where o.customer_id = c.customer_id
+)
+
+
+SELECT column1, column2,...
+FROM GOLD.FACT_SALES f
+JOIN GOLD.DIM_CUSTOMER c
+  ON f.customer_id = c.customer_id
+WHERE f.event_ts >= '2026-02-10 00:00:00'::TIMESTAMP_NTZ AND f.event_ts < '2026-02-11 00:00:00'::TIMESTAMP_NTZ;
+
+with watermark as (
+  SELECT COALESCE(MAX(ingestion_ts), '1970-01-01'::TIMESTAMP_NTZ) AS max_ts
+  FROM SILVER.EVENTS
+),
+new_events as (
+  SELECT 
+    event_id::STRING                                   AS event_id,
+    ingestion_ts::TIMESTAMP_NTZ                        AS ingestion_ts,
+    payload:user_id::NUMBER                            AS user_id,
+    payload:event_type::STRING                         AS event_type,
+    TO_TIMESTAMP_NTZ(payload:event_ts::STRING)         AS event_ts
+  FROM BRONZE.EVENTS_RAW
+  WHERE ingestion_ts >= (SELECT max_ts FROM watermark) - INTERVAL '1 day'
+)
+SELECT *
+FROM src
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY event_id
+  ORDER BY ingestion_ts DESC
+) = 1;
